@@ -51,7 +51,7 @@ export interface EngineContext extends SurfaceContext {
      *  can splice into it without casting away the public readonly contract. */
     _surfaces: [SurfaceContext, ...SurfaceContext[]];
 
-    /** Number of GPU draw calls in the last rendered frame, summed across all surfaces. */
+    /** Number of GPU draw calls in the latest {@link renderFrame} call, summed across its selected surfaces. */
     drawCallCount: number;
 
     /** GPU time spent on the last measured frame, in milliseconds — 0 until the first measured frame and
@@ -523,7 +523,7 @@ export function startEngine(engine: EngineContext): Promise<void> {
             const delta = firstRafFrame ? 0 : lastTime > 0 ? now - lastTime : 16.667;
             lastTime = now;
             resizeEngine(engine);
-            renderFrame(engine, delta);
+            _renderFrame(engine, delta);
             if (firstRafFrame) {
                 firstRafFrame = false;
                 resolve();
@@ -580,22 +580,38 @@ export function disposeEngine(engine: EngineContext): void {
     engine._device.destroy();
 }
 
-/** Render one frame for every surface registered on the engine. Updates each rendering context, records its GPU work into a shared command encoder, submits the frame, and publishes the total draw-call count. */
-export function renderFrame(engine: EngineContext, delta: number): void {
-    const surfaces = engine.surfaces;
-    // `surfaces` is typed as a non-empty tuple — the engine itself is always at
-    // index 0 — so we don't need to guard against an empty list. Still skip the
-    // encoder allocation if no surface has any rendering contexts.
+/**
+ * Render one frame through one shared command encoder and queue submission.
+ *
+ * Omitting `surfaces` renders every registered engine surface in registration order.
+ * Pass a non-empty readonly tuple to render an explicit subset instead. Engine ownership
+ * is checked because mixing devices would otherwise produce cryptic WebGPU validation
+ * failures; callers must keep the tuple registered through the call and unique.
+ */
+export function renderFrame(engine: EngineContext, delta: number, surfaces = engine.surfaces): void {
+    if (surfaces !== engine.surfaces) {
+        for (let i = surfaces.length; i--;) {
+            if (surfaces[i]!.engine !== engine) {
+                throw new Error("renderFrame: surface belongs to a different engine.");
+            }
+        }
+    }
+
+    _renderFrame(engine, delta, surfaces);
+}
+
+function _renderFrame(engine: EngineContext, delta: number, surfaces: readonly [SurfaceContext, ...SurfaceContext[]] = engine._surfaces): void {
+    // Skip the encoder allocation if no selected surface has any rendering contexts.
     let total = 0;
-    for (let i = 0; i < surfaces.length; i++) {
+    for (let i = surfaces.length; i--;) {
         total += surfaces[i]!._renderingContexts.length;
     }
-    if (total === 0) {
+    if (!total) {
+        engine.drawCallCount = 0;
         // Nothing left to draw (e.g. the last scene was unregistered). No submit will happen this frame,
         // so any retirement queued by that removal has to be drained behind a fence instead of waiting
         // for a `queue.submit` that will never come.
-        flushGpuResourceRetirements(engine);
-        return;
+        return flushGpuResourceRetirements(engine);
     }
 
     const encoder = engine._device.createCommandEncoder({ label: "frame" });
@@ -609,7 +625,7 @@ export function renderFrame(engine: EngineContext, delta: number): void {
     // them contiguously around this frame's passes — measuring only the frame's own GPU work.
     engine._gpuTimerBegin?.(encoder);
 
-    let drawCalls = 0;
+    total = 0;
     for (let i = 0; i < surfaces.length; i++) {
         const surface = surfaces[i]!;
         // A queued screenshot (`captureScreenshot`) needs this surface's swapchain marked COPY_SRC
@@ -623,8 +639,7 @@ export function renderFrame(engine: EngineContext, delta: number): void {
         for (let j = 0; j < ctxs.length; j++) {
             const s = ctxs[j]!;
             s._update();
-            drawCalls += s._drawCallsPre;
-            drawCalls += s._record();
+            total += s._drawCallsPre + s._record();
         }
     }
 
@@ -634,8 +649,7 @@ export function renderFrame(engine: EngineContext, delta: number): void {
     // never capture keep this to a single short-circuit and ship none of the readback code.
     // Each service records its surface's swapchain copy into this frame's encoder.
     for (let i = 0; i < surfaces.length; i++) {
-        const surface = surfaces[i]!;
-        surface._captureService?.(surface, finalEncoder);
+        surfaces[i]!._captureService?.(surfaces[i]!, finalEncoder);
     }
     // Closing timestamp goes in just before the frame encoder is finished, so it bookends exactly the
     // frame's recorded GPU work (a no-op short-circuit when timing is disabled).
@@ -643,7 +657,7 @@ export function renderFrame(engine: EngineContext, delta: number): void {
     engine._cbs[0] = finalEncoder.finish();
     engine._device.queue.submit(engine._cbs);
     flushGpuResourceRetirements(engine);
-    engine.drawCallCount = drawCalls;
+    engine.drawCallCount = total;
     // Resolve + read back the timestamp pair asynchronously (its own submit, after the frame's) and
     // publish the latest completed sample to `gpuFrameTimeMs`. Non-blocking — never stalls this frame.
     engine._gpuTimerResolve?.();
